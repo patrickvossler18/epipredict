@@ -1,0 +1,232 @@
+---
+title: "Implementing a scorecaster for quantile calibration"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  warning = FALSE,
+  message = FALSE,
+  cache = TRUE
+)
+```
+
+
+```{r packages}
+library(tidyverse)
+library(epipredict)
+```
+
+First we get some forecasts for cases and deaths.
+
+```{r forecast-output}
+# jhu is a dataframe with columns geo_value, time_value, case_rate, death_rate
+jhu <- case_death_rate_subset
+fc_time_values <- seq(as.Date("2021-03-09"), as.Date("2021-12-01"), by = "4 weeks")
+q_levels <- c(1,  5,  9) / 10
+forecaster <- function(x, pred_col, aheads = 7) {
+  map(aheads, ~ arx_forecaster(
+    x, pred_col, c("case_rate", "death_rate"),
+    quantile_reg(quantile_levels = q_levels),
+    arx_args_list(ahead = .x, quantile_levels = q_levels)
+  )$predictions |>
+    mutate(ahead = .x)
+  ) |> list_rbind()
+}
+```
+
+
+```{r forecast-output}
+deaths_out <- map(
+  .x = fc_time_values,
+  .f = ~forecaster(jhu %>% filter(time_value <= .x), "death_rate", c(7, 14, 21, 28)),
+  .progress = TRUE
+)
+
+deaths_out <- deaths_out %>% list_rbind()
+deaths_out <- left_join(
+  deaths_out,
+  jhu,
+  by = c("target_date" = "time_value", "geo_value")
+)
+```
+
+
+```{r forecast-output}
+cases_out <- map(
+  .x = fc_time_values,
+  .f = ~forecaster(jhu %>% filter(time_value <= .x), "case_rate", c(7, 14, 21, 28)),
+  .progress = TRUE
+)
+cases_out <- cases_out %>% list_rbind()
+cases_out <- left_join(
+  cases_out,
+  jhu,
+  by = c("target_date" = "time_value", "geo_value")
+)
+
+```
+
+This step is to get the data into a form that mirrors the Jupyter notebook, but
+need to refactor this to make it more idiomatic.
+
+```{r}
+deaths_prepared_data <- deaths_out %>% 
+  left_join(state_census %>% select(abbr, pop), by = c("geo_value" = "abbr")) %>% 
+  mutate(
+    forecast_0.1 = map_dbl(.pred_distn, ~quantile(.x, 0.1)),
+    forecast_0.5 = map_dbl(.pred_distn, ~quantile(.x, 0.5)),
+    forecast_0.9 = map_dbl(.pred_distn, ~quantile(.x, 0.9))
+  )  %>% 
+  mutate(
+    score_upper = (death_rate - forecast_0.9) / pop,
+    score_lower = (forecast_0.1 - death_rate) / pop
+  ) %>%
+  as_epi_df()
+```
+
+Repeat the process for cases but also get normalized upper and lower scores,
+again to mirror the Jupyter notebook.
+```{r}
+cases_prepared_data <- cases_out %>% 
+  left_join(state_census %>% select(abbr, pop), by = c("geo_value" = "abbr")) %>% 
+  mutate(
+    forecast_0.1 = map_dbl(.pred_distn, ~quantile(.x, 0.1)),
+    forecast_0.5 = map_dbl(.pred_distn, ~quantile(.x, 0.5)),
+    forecast_0.9 = map_dbl(.pred_distn, ~quantile(.x, 0.9))
+  )  %>% 
+  mutate(
+    cases_score_upper = (case_rate - forecast_0.9) / pop,
+    cases_score_norm_upper = (case_rate - forecast_0.9) / case_rate,
+    cases_score_lower = (forecast_0.1 - case_rate) / pop,
+    cases_score_norm_lower = (forecast_0.1 - case_rate) / case_rate
+  ) %>%
+  as_epi_df()
+```
+
+
+Before performing the backtesting, the Jupyter notebook does some pre-processing
+of the data. Specifically, it loops over each state and creates a score `TimeSeries`
+object and a covariates `TimeSeries` object as shown here
+
+```
+ts_scores_upper = TimeSeries.from_dataframe(data[geo_idx], time_col='target_end_date', value_cols='score_upper')
+ts_covariates = TimeSeries.from_group_dataframe(data, group_cols='geo_value', time_col='target_end_date', value_cols=['score_upper', 'actual']) + [ 
+    TimeSeries.from_dataframe(data[geo_idx], time_col='target_end_date', value_cols=['cases_score_upper', 'cases_score_upper_normalized']) 
+]
+```
+
+The first line of `ts_covariates` creates a `TimeSeries` object with death score
+and actual death rate. Darts stores the data for each `geo_value` as
+a separate `DataArray` in a list. Then, because the `TimeSeries` object is just a list,
+they append the case scores to that list.
+
+It seems like `epipredict` expects the data in a single data frame so we'll just
+column-bind the state death scores, actual death rates, and case scores into one big data frame for each state.
+Then we'll stack all of these dataframes together.
+
+This is a hacky way that assumes the dates are all aligned in terms of `time_value` and should be optimized. 
+Is there some way to iteratively merge the dataframes that might be more efficient?
+```{r}
+states = deaths_prepared_data %>% distinct(geo_value) %>% pull()
+prepped_data <- map_dfr(states, function(state) {
+  # we want to predict this
+  ts_scores <- deaths_prepared_data %>%
+    filter(geo_value == state) %>%
+    select(geo_value, time_value, score_lower, score_upper)
+  
+  # we're going to combine the scores from all the states with the case scores for this particular state
+  ts_cases <- cases_prepared_data %>% filter(geo_value == state) %>% select(
+    geo_value,
+    time_value,
+    cases_score_lower,
+    cases_score_norm_lower,
+    cases_score_upper,
+    cases_score_norm_upper
+  )
+  
+  all_states_df = map_dfc(states, function(state) {
+    prepared_data %>%
+      filter(geo_value == state) %>%
+      select(score_lower, score_upper, death_rate) %>%
+      rename_with(., ~ paste0(state, "_", .x))
+  }) %>%
+    mutate(time_value = ts_scores_lower$time_value) %>% select(time_value, everything())
+  
+  state_covariates <- ts_cases %>% inner_join(all_states_df, by = "time_value")
+  
+  full_df <- ts_scores %>% left_join(state_covariates, by = c("geo_value", "time_value"))
+  
+  return(full_df)
+})
+```
+
+We can get our data for forecasting upper and lower scores separately by selecting
+the columns that end with `_lower` or `_upper`
+
+```{r}
+lower_prepped_data <- prepped_data %>% select(geo_value, time_value, ends_with("_lower"), ends_with("_death_rate"))
+lower_prepped_data %>% head()
+```
+
+```{r}
+upper_prepped_data <- prepped_data %>% select(geo_value, time_value, ends_with("_upper"), ends_with("_death_rate"))
+upper_prepped_data %>% head()
+```
+
+Next we need to lag the data. In the Python code they do the following:
+```
+model_lower = RegressionModel(lags=[-weeks_ahead, -weeks_ahead-1, -weeks_ahead-2], lags_past_covariates=[-weeks_ahead], model=qr_lower)
+```
+
+
+-----------------------
+
+Now we set up the "quantile conformal score" and the tangent integrator.
+
+```{r necessary-funs}
+quantile_conformal_score <- function(x, actual) {
+  UseMethod("quantile_conformal_score")
+}
+quantile_conformal_score.distribution <- function(x, actual) {
+  l <- vctrs::vec_recycle_common(x = x, actual = actual)
+  map2(
+    .x = vctrs::vec_data(l$x),
+    .y = l$actual,
+    .f = quantile_conformal_score
+  )
+}
+quantile_conformal_score.dist_quantiles <- function(x, actual) {
+  values <- vctrs::field(x, "values")
+  quantile_levels <- vctrs::field(x, "quantile_levels")
+  errs <- (actual - values) * (quantile_levels > 0.5) +
+    (values - actual) * (quantile_levels < 0.5) +
+    abs(actual - values) * (quantile_levels == 0.5)
+  errs
+}
+
+tangent_integrator <- function(x, t, KI = 1000, Csat = 2) {
+  # defaults from https://github.com/aangelopoulos/conformal-time-series/blob/b729c3f5ff633bfc43f0f7ca08199b549c2573ac/tests/configs/ca-COVID-deaths-4wk.yaml#L41
+  x <- x * log(t + 1) / (Csat * (t + 1))
+  up <- x >= pi / 2
+  down <- x <= -pi / 2
+  x[up] <- Inf
+  x[down] <- -Inf
+  mid <- !up & !down
+  x[mid] <- KI * tan(x[mid])
+}
+```
+
+Score the forecasts.
+
+```{r score-fcasts}
+out <- out |>
+  mutate(qc_scores = quantile_conformal_score(.pred_distn, death_rate))
+```
+
+Now we would need a "scorecaster". The paper has code here: 
+https://github.com/aangelopoulos/conformal-time-series/blob/b729c3f5ff633bfc43f0f7ca08199b549c2573ac/tests/datasets/covid-ts-proc/statewide/death-forecasting-perstate-lasso-qr.ipynb
+
+Not quite sure what the model is. Note that `epipredict::quantile_reg()` may work
+(without the $\ell_1$ penalty).
